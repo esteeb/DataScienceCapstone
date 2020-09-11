@@ -1,0 +1,362 @@
+---
+title: "Milestone Report"
+author: "Erik Rehnberg Steeb"
+date: "8/22/2020"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning=FALSE, message=FALSE, cache.lazy = FALSE)
+library(tidytext)
+library(tidyverse)
+
+```
+
+The first step will be to load in the entire dataset in order to perform some initial exploratory analysis. As the data is loaded and explored, I'll be saving bi-, tri-, and quadgrams to be later used in the prediction model. The basic idea will be to avoid saving anything that only appears once in the dataset, possibly making a few other tweaks as the model is refined in order to try and save memory, keep the final set small, and improve performance. While the assignment recommends only using around 10% of the dataset as random samples I will be attempting to use the full dataset, given access to 32GB of RAM and a fairly fast processor. I'll also be fairly aggressive in removing variables once they are no longer needed in order to preserve memory availabilty. 
+
+
+``` {r load data}
+# Load stopwords
+data("stop_words")
+
+# Load swearwords
+swearWords <- as.data.frame(t(read.csv("final/swearWords.csv", header = FALSE)))
+colnames(swearWords) <- "txt"
+swearWords <- swearWords %>%
+  filter(!is.na(txt))
+
+# Load lines
+
+if (!exists("enBlogs1.rds")) {
+  rawBlogs <- readLines(con = file("./final/en_US/en_US.blogs.txt"), encoding = "UTF-8", skipNul = TRUE)
+  saveRDS(rawBlogs,"enBlogs1.rds")
+} else readRDS("enBlogs1.rds")
+
+if (!exists("enNews1.rds")) {
+  rawNews <- readLines(con = file("./final/en_US/en_US.news.txt"), encoding = "UTF-8", skipNul = TRUE)
+  saveRDS(rawNews,"enNews1.rds")
+} else readRDS("enNews1.rds")
+
+if (!exists("enTwitter1.rds")) {
+  rawTwitter <- readLines(con = file("./final/en_US/en_US.twitter.txt"), encoding = "UTF-8", skipNul = TRUE)
+  saveRDS(rawTwitter,"enTWitter1.rds")
+  close(file("./final/en_US/en_US.twitter.txt"))
+} else readRDS("enTwitter1.rds")
+
+close(file("./final/en_US/en_US.twitter.txt"))
+
+
+```
+
+## Initial analysis
+
+The first step will simply be to look at the initial structure of the data. First, let's look at how many characters there are in each line of the dataset.
+
+```{r boxplots}
+
+blogs_nchar   <- nchar(rawBlogs)
+news_nchar    <- nchar(rawNews)
+twitter_nchar <- nchar(rawTwitter)
+
+boxplot(blogs_nchar, news_nchar, twitter_nchar, log = "y",
+        names = c("blogs", "news", "twitter"),
+        ylab = "log(Number of Characters)", xlab = "File Name") 
+title("Comparing Distributions of Chracters per Line")
+
+```
+
+## Data Cleaning
+
+This section is the bulk of the work. First, it will read the data files into dataframes. 
+
+```{r processing}
+
+
+dfblogs   <- tibble(text = rawBlogs)
+dfblogs   <- cbind("blogs", dfblogs)
+colnames(dfblogs) <- c("source", "text")
+dfnews    <- tibble(text = rawNews)
+dfnews    <- cbind("news", dfnews)
+colnames(dfnews) <- c("source", "text")
+dftwitter <- tibble(text = rawTwitter)
+dftwitter <- cbind("twitter", dftwitter)
+colnames(dftwitter) <- c("source", "text")
+
+# Combine into one df
+
+dfAll     <- rbind(dfblogs, dfnews, dftwitter)
+colnames(dfAll) <- c("source", "text")
+rm(dfblogs, dfnews, dftwitter)
+rm(rawBlogs)
+rm(rawTwitter)
+rm(rawNews)
+
+
+```
+
+Next, we'll do some cleaning, particularly by removing URLs, single letters at the start of lines, and words with three or more repetitions of the same letter. Additionally, we'll ensure that everything is encoded in ASCII. From there, the dataset is converted into a tidy format, which will allow exploration and modeling using the tidytext package. Finally, for initial exploration, stopwords are removed, but will be used to develop the actual model, since they are important parts of the language. 
+
+``` {r cleaning, error = TRUE}
+# Setup cleaning
+swearWords <- unnest_tokens(swearWords, input = "txt", token = "words",output = "words", to_lower = TRUE)
+swearWords <- as.vector(swearWords)
+
+stopWords <- as.vector(stop_words[,1])
+
+replace_reg <- "[^[:alpha:][:space:]]*"
+replace_url <- "http[^[:space:]]*"
+replace_aaa <- "(\\w)\\1{2,}"
+
+dfClean <- dfAll %>%
+  mutate(text = str_replace_all(text, replace_reg, ""), .keep = "unused")%>%
+  mutate(text = str_replace_all(text, replace_url, ""), .keep = "unused")%>%
+  mutate(text = str_replace_all(text, replace_aaa, ""), .keep = "unused")%>%
+  mutate(text = iconv(text, from = "UTF-8", to = "ASCII//TRANSLIT"))
+
+rm(dfAll)
+ 
+
+# Convert to tidy format
+
+dfTidy <- unnest_tokens(dfClean, output = "text", input = "text", token = "words", to_lower = TRUE)
+
+rm(dfClean)
+
+# Remove swear words
+
+dfTidy <- dfTidy%>%
+  anti_join(swearWords, by = c("text" = "words"))
+saveRDS(dfTidy, "dfTidy.rds")
+
+# Remove stopwords for analysis (will be needed)
+dfTidyExplore <- dfTidy%>%
+  anti_join(stopWords, by = c("text" = "word"))
+
+corpSize <- as.numeric(object.size(dfTidy))
+
+corpSizeMB <- trunc(corpSize / 1000000)
+
+
+```
+
+With swear words, stop words, and words with extensive repeats of the same letter (n >=3), the set of remaining words is `{r} corpSizeMB ` megabytes large. This is large, but still manageable to be held in memory in a reasonably modern computer. 
+
+## Exploratory Data Analysis
+
+
+### Individual words
+
+``` {r basic exploration}
+
+# Total number of distinct words
+cDistinctWords <- dfTidyExplore%>%
+  summarize(distinct = n_distinct(text))
+
+# Words required to achieve coverage of 50% and 90% (with stopwords removed)
+distinctWords <- dfTidyExplore%>%
+  count(text)%>%
+  mutate(density = n / sum(n))%>%
+  arrange(desc(density))%>%
+  mutate(cover = cumsum(density))
+
+cover50 <- distinctWords %>%
+  filter(cover <= .5)
+ncover50 <- nrow(cover50)
+
+cover90 <- distinctWords%>%
+  filter(cover <= .9)
+ncover90 <- nrow(cover90)
+
+#wordPlot <- cover50 %>%
+ # top_n(20, distinctWords) %>%
+  #mutate(text = reorder(text, density)) %>%
+  #ggplot(aes(text, density)) +
+  #geom_col() +
+  #xlab(NULL) +
+  #coord_flip()
+
+#wordPlot
+
+```
+
+There are a total of `{r} cDistinctWords` 
+
+``` {r cleanup1}
+
+rm(coverage, cover50, cover90)
+```
+
+### Bigrams
+
+
+``` {r bigrams}
+# Top bigrams, trigrams, quadgrams in the dataset
+
+## Bigram analysis
+bigrams <- unnest_tokens(tbl = dfTidy, output = "bigrams", input = "text", token = "ngrams", n = 2)
+
+colnames(bigrams) <- c("source", "bigram")
+
+countDistinctBigrams <- bigrams%>%
+  summarize(distinct = n_distinct(bigram))
+
+
+distinctBigrams <- bigrams%>%
+  count(bigram)%>%
+  mutate(bidensity = n / sum(n))%>%
+  arrange(desc(bidensity))%>%
+  mutate(cover = cumsum(bidensity))
+  
+bicover50 <- distinctBigrams %>%
+  filter(cover <=.50)
+nbicover50 <- nrow(bicover50)
+
+bicover90 <- distinctBigrams %>%
+  filter(cover <=.9)
+nbicover90 <- nrow(bicover90)
+
+biPlot <- bicover50 %>%
+  top_n(20, n) %>%
+  mutate(bigram = reorder(bigram, bidensity)) %>%
+  ggplot(aes(bigram, bidensity)) +
+  geom_col() +
+  xlab(NULL) +
+  coord_flip()
+
+biPlot
+
+```
+
+
+
+The plot above shows the top 20 bigrams from the dataset. Additionally, we'll use the bigrams that allow coverage of 90% of the dataset for now in the model. 
+
+``` {r model bigrams}
+modelBigrams <- bicover50 %>%
+  filter(n >= 5)%>%
+  select(bigram)%>%
+  separate(col = bigram, into = c("word1", "word2"), sep = " ", remove = TRUE)%>%
+  filter(word1 != "of")
+
+saveRDS(modelBigrams, paste0(getwd(),"/model/data/modelBigrams.rds"))
+```
+
+### Trigrams
+
+``` {r trigrams}
+
+## Trigrams
+dfTidy <- readRDS("dfTidy.rds")
+trigrams <- unnest_tokens(tbl = dfTidy, output = "trigrams", input = "text", token = "ngrams", n = 3)
+rm(dfTidy)
+gc()
+
+
+colnames(trigrams) <- c("source", "trigram")
+
+countDistinctTrigrams <- trigrams%>%
+  summarize(distinct = n_distinct(trigram))
+
+
+distinctTrigrams <- trigrams%>%
+  count(trigram)%>%
+  mutate(tridensity = n / sum(n))%>%
+  arrange(desc(tridensity))%>%
+  mutate(cover = cumsum(tridensity))
+```
+
+
+
+
+
+``` {r trigram cover}
+  
+tricover50 <- distinctTrigrams %>%
+  filter(cover <=.50)
+ntricover50 <- nrow(tricover50)
+
+tricover90 <- distinctTrigrams %>%
+  filter(cover <=.9)
+ntricover90 <- nrow(tricover90)
+
+triPlot <- tricover90 %>%
+  top_n(20, n) %>%
+  mutate(trigram = reorder(trigram, tridensity)) %>%
+  ggplot(aes(trigram, tridensity)) +
+  geom_col() +
+  xlab(NULL) +
+  coord_flip()
+
+triPlot
+
+
+```
+
+
+Not at all surprisingly, many of the most common trigrams end in some of the most common words - "the", "of", and "a". By summing coverage of the corpus, we see that we need ` {r} prettyNum(ntricover50, big.mark = ",") ` distinct trigrams in order to cover 50% of the corpus. We need an additional ` {r} prettyNum((tricover90 - tricover50), big.mark = ",") ` trigrams, for a total of ` {r} prettyNum(tricover90, big.mark = ",")` trigrams, to cover 90% of the corpus. For the model, however, we will only be using frequently used trigrams in order to ensure the model can run in a manageable amount of time. 
+
+``` {r model trigrams}
+
+# This will eliminate all unique trigrams in the tricover90 set
+modelTri <- tricover50 %>%
+  filter(n >= 10)%>%
+  separate(col = trigram, into = c("word1", "word2", "word3"), sep = " ", remove = TRUE)
+coverModelTri <- modelTri[nrow(modelTri),ncol(modelTri)]
+
+saveRDS(modelTri%>%
+          select(word1, word2, word3)
+        , paste0(getwd(),"/model/data/modelTrigrams.rds"))
+
+rm(modelTri)
+rm(distinctTrigrams, tricover50, tricover90)
+
+```
+
+By removing rarely used trigrams (n < 10), we're able to dramatically reduce the number of trigrams without impacting accuracy too extensively: Those trigrams that only show up once in the (considerable) corpus are unlikely to be typed into the word prediciton engine. It will cover slightly more than 50% of the corpus, with coverage of ` {r} trunc((coverModelTri * 100), digits = 2)`% of the corpus.
+
+### Quadgrams
+
+``` {r quadgrams}
+
+## Quadgrams
+dfTidy <- readRDS("dfTidy.rds")
+quadgrams <- tidytext::unnest_tokens(tbl = dfTidy, output = "quadgram", input = "text", token = "ngrams", n = 4)
+rm(dfTidy)
+gc()
+
+
+colnames(quadgrams) <- c("source", "quadgram")
+
+countDistinctQuadgrams <- quadgrams%>%
+  summarize(distinct = n_distinct(quadgram))
+
+
+distinctQuadgrams <- quadgrams%>%
+  count(quadgram)%>%
+  mutate(quaddensity = n / sum(n))%>%
+  arrange(desc(quaddensity))%>%
+  mutate(cover = cumsum(quaddensity))
+  
+quadcover50 <- distinctQuadgrams %>%
+  filter(cover <=.50)
+nquadcover50 <- nrow(quadcover50)
+
+quadcover90 <- distinctQuadgrams %>%
+  filter(cover <=.9)
+nquadcover90 <- nrow(quadcover90)
+```
+
+
+
+As we did with trigrams, we'll remove the infrequently used quadgrams from this set, and save the quadgrams to be used in the model. 
+
+``` {r model quadgrams}
+modelQuad <- quadcover50 %>%
+  filter(n >= 10)%>%
+  select(quadgram)%>%
+  separate(col = quadgram, into = c("word1", "word2", "word3", "word4"), sep = " ", remove = TRUE)
+
+saveRDS(modelQuad, paste0(getwd(),"/model/data/modelQuadgrams.rds"))
+
+```
+
